@@ -17,9 +17,9 @@ Model converted using OpenVINO 2021.2 and Open Model Zoo.
 
 ```bash
 python main.py -m_a common-sign-language-0001.xml -m_d person-detection-asl.xml -i <camera_id> -d CPU
+```
 
-
-TO DO
-[] installation way for Raspberry Pi
-[] add ONNX RunTime backend
-[] handle false positives
+## TO DO:
+- [ ] installation way for Raspberry Pi
+- [ ] add ONNX RunTime backend
+- [ ] handle false positives
