@@ -1,0 +1,5 @@
+opencv-python
+# if you does not have openvino package
+openvino
+numpy
+scipy
