@@ -1,17 +1,17 @@
 import os
-from typing import Tuple
-import io
 import time
 import argparse
 import numpy as np
 import cv2
-import onnxruntime.backend as backend
-import onnx
 import light_control
+from action_recognizer import TSMActionRecognizer
+from detector import Detector, Tracker
 
 SOFTMAX_THRES = 0.8
 HISTORY_LOGIT = True
 REFINE_OUTPUT = True
+TRACKER_SCORE_THRESHOLD = 0.4
+TRACKER_IOU_THRESHOLD = 0.3
 WINDOW_NAME = 'Video Gesture Recognition'
 
 categories = [
@@ -50,60 +50,18 @@ def build_argparser():
     parser.add_argument('-m', '--model', help='path to onnx model', required=True)
     parser.add_argument('-s', '--stream', help='mode for demo video stream', choices=['gui', 'video', 'none'],
                         default='gui')
+    parser.add_argument('-m_d', '--detection_model', help='path to onnx detector model', required=True)
+    parser.add_argument('-d', '--device', help='device for execution', required=False, default='CPU')                          
 
     return parser
 
-
-def get_executor(model):
-    beckend_rep = backend.prepare(model=str(model))
-    sess = beckend_rep._session
-    inputs_info = sess.get_inputs()
-    input_names = [input_layer.name for input_layer in inputs_info]
-    outputs = sess.get_outputs()
-    output_names = [output.name for output in outputs]
-    return sess, input_names, output_names
-
-
-def transform(frame: np.ndarray):
-    # 480, 640, 3, 0 ~ 255
-    frame = cv2.resize(frame, (224, 224))  # (224, 224, 3) 0 ~ 255
-    frame = frame.astype(np.float32) / 255.0  # (224, 224, 3) 0 ~ 1.0
-    frame -= np.array([0.485, 0.456, 0.406])
-    frame /= np.array([0.229, 0.224, 0.225])
-    frame = np.transpose(frame, axes=[2, 0, 1])  # (3, 224, 224) 0 ~ 1.0
-    frame = np.expand_dims(frame, axis=0)  # (1, 3, 480, 640) 0 ~ 1.0
-    return frame
-
-
-def process_output(idx_, history):
-    # idx_: the output of current frame
-    # history: a list containing the history of predictions
-    if not REFINE_OUTPUT:
-        return idx_, history
-
-    max_hist_len = 20  # max history buffer
-
-    # mask out illegal action
-    if idx_ in [7, 8, 21, 22, 3]:
-        idx_ = history[-1]
-
-    # use only single no action class
-    if idx_ == 0:
-        idx_ = 2
-
-    # history smoothing
-    if idx_ != history[-1]:
-        if not (history[-1] == history[-2]):  # and history[-2] == history[-3]):
-            idx_ = history[-1]
-
-    history.append(idx_)
-    history = history[-max_hist_len:]
-
-    return history[-1], history
-
-
 def main():
     args = build_argparser().parse_args()
+    print("Build Executor...")
+    action_recognizer = TSMActionRecognizer(args.model, args.device, refine_output=REFINE_OUTPUT, softmax_thresh=SOFTMAX_THRES, history_logit=HISTORY_LOGIT)
+    detector = Detector(args.detection_model, args.device)
+    tracker = Tracker(detector, TRACKER_SCORE_THRESHOLD, TRACKER_IOU_THRESHOLD)
+    idx = 0
     print("Open camera...")
     cap = cv2.VideoCapture(0)
 
@@ -122,25 +80,6 @@ def main():
 
     light_controler = light_control.LightContoller()
     t = None
-    print("Build transformer...")
-    print("Build Executor...")
-    executor, input_names, output_names = get_executor(args.model)
-    buffer = [
-        np.zeros((1, 3, 56, 56), dtype=np.float32),
-        np.zeros((1, 4, 28, 28), dtype=np.float32),
-        np.zeros((1, 4, 28, 28), dtype=np.float32),
-        np.zeros((1, 8, 14, 14), dtype=np.float32),
-        np.zeros((1, 8, 14, 14), dtype=np.float32),
-        np.zeros((1, 8, 14, 14), dtype=np.float32),
-        np.zeros((1, 12, 14, 14), dtype=np.float32),
-        np.zeros((1, 12, 14, 14), dtype=np.float32),
-        np.zeros((1, 20, 7, 7), dtype=np.float32),
-        np.zeros((1, 20, 7, 7), dtype=np.float32)
-    ]
-    idx = 0
-    history = [2]
-    history_logit = []
-    history_timing = []
 
     if args.stream == 'video':
         fps = 7
@@ -151,6 +90,10 @@ def main():
     os.system(f'v4l2-ctl -c white_balance_auto_preset=1')
     t1 = time.time()
     i_frame = -1
+    tracker_labels_map = dict()
+    tracker_labels = set()
+    last_caption = None
+    active_object_id = -1
     print("Ready!")
     while True:
         try:
@@ -158,31 +101,23 @@ def main():
             ret, img = cap.read()  # (480, 640, 3) 0 ~ 255
             if not ret:
                 break
-            img_tran = transform(img)
-            inputs = [img_tran] + buffer
-            outputs = executor.run(output_names, dict(zip(input_names, inputs)))
-            feat, buffer = outputs[0], outputs[1:]
+            detections, tracker_labels_map = tracker.add_frame(img, 1, tracker_labels_map)
+            if detections is None:
+                active_object_id = -1
+                last_caption = None
 
-            if SOFTMAX_THRES > 0:
-                feat_np = np.reshape(feat, -1)
-                feat_np -= feat_np.max()
-                softmax = np.exp(feat_np) / np.sum(np.exp(feat_np))
-                if max(softmax) > SOFTMAX_THRES:
-                    idx_ = np.argmax(feat, axis=1)[0]
-                else:
-                    idx_ = idx
-            else:
-                idx_ = np.argmax(feat, axis=1)[0]
+            if len(detections) == 1:
+                active_object_id = 0
 
-            if HISTORY_LOGIT:
-                history_logit.append(feat)
-                history_logit = history_logit[-12:]
-                avg_logit = sum(history_logit)
-                idx_ = np.argmax(avg_logit, axis=1)[0]
+            if active_object_id >= 0:
+                cur_det = [det for det in detections if det.id == active_object_id]
+                if len(cur_det) != 1:
+                    active_object_id = -1
+                    last_caption = None
+                    continue
 
-            idx, history = process_output(idx_, history)
-
-            print(f"{i_frame} {categories[idx]}")
+                idx = action_recognizer(img, cur_det[0].roi.reshape(-1))
+                print(f"{i_frame} {categories[idx]}")
             light_controler.encode_gesture(idx)
             if i_frame % 5 == 0:
                 t2 = time.time()
